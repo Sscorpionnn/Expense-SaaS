@@ -1,0 +1,285 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same branch/PR to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22"
+  PNPM_VERSION: "9.15.9"
+
+jobs:
+  install:
+    name: Install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+  lint:
+    name: Lint
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+
+  typecheck:
+    name: Typecheck
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+
+  unit-tests:
+    name: Unit tests
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:unit
+
+  integration-tests:
+    name: Integration tests
+    needs: install
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: expense_saas_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test -d expense_saas_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://test:test@localhost:5432/expense_saas_test?schema=public
+      REDIS_URL: redis://localhost:6379
+      WEB_URL: http://localhost:3000
+      API_URL: http://localhost:4000
+      S3_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: test
+      S3_SECRET_ACCESS_KEY: test
+      S3_BUCKET_EXPORTS: expense-saas-exports
+      S3_BUCKET_IMPORTS: expense-saas-imports
+      SMTP_HOST: localhost
+      SMTP_PORT: "1025"
+      SMTP_FROM: "Expense SaaS <no-reply@expense-saas.local>"
+      SESSION_COOKIE_SECRET: ci-only-session-secret-do-not-reuse-0000000000
+      CSRF_SECRET: ci-only-csrf-secret-do-not-reuse-000000000000000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # MinIO can't be a GitHub Actions "services:" container (its image has
+      # no default CMD to run the server) — start it as a plain container.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=test -e MINIO_ROOT_PASSWORD=test \
+            minio/minio server /data --console-address ":9001"
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            sleep 1
+          done
+      # Note: requires a committed initial migration — generate it once
+      # locally against `docker compose up -d postgres` with:
+      #   pnpm --filter @expense-saas/database migrate:dev --name init
+      - run: pnpm --filter @expense-saas/database exec prisma migrate deploy
+      - run: pnpm test:integration
+
+  build:
+    name: Build
+    needs: install
+    runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+      API_URL: http://localhost:4000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+  security-scan:
+    name: Secret scan (Gitleaks)
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Gitleaks scans git history, not just the working tree.
+          fetch-depth: 0
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # .gitleaks.toml allowlists the known-fake CI/dev placeholder
+          # secrets used below and in .env.example — real secrets still fail
+          # this scan.
+          GITLEAKS_CONFIG: .gitleaks.toml
+          # Only required if/when this repo is private — the Gitleaks Action
+          # is free for public repos without one. Add a GITLEAKS_LICENSE
+          # secret if this ever moves to a private repo.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  dependency-audit:
+    name: Dependency audit
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # High/critical only: low/moderate advisories are common in transitive
+      # dev-tooling dependencies we don't control and would make this check
+      # too noisy to act on, defeating the point of blocking on it.
+      - run: pnpm audit --audit-level=high
+
+  e2e:
+    name: E2E (Playwright)
+    needs: [lint, typecheck, unit-tests, integration-tests, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install Playwright's browser
+        working-directory: apps/e2e
+        run: pnpm exec playwright install --with-deps chromium
+
+      # docker-compose.yml pulls every secret from the environment with a
+      # "CHANGE_ME" fallback; SESSION_COOKIE_SECRET/CSRF_SECRET fail
+      # validation (packages/config/src/env.ts requires >= 32 chars) unless
+      # overridden, so give the stack CI-only values via a .env file — same
+      # pattern as the integration-tests job's inline env, just compose-shaped.
+      - name: Write CI-only .env for docker compose
+        run: |
+          cat > .env <<'EOF'
+          POSTGRES_USER=ci
+          POSTGRES_PASSWORD=ci-only-postgres-password
+          POSTGRES_DB=expense_saas
+          MINIO_ROOT_USER=ci-only-minio-user
+          MINIO_ROOT_PASSWORD=ci-only-minio-password
+          WEB_URL=http://localhost:3000
+          NEXT_PUBLIC_API_URL=http://localhost:4000
+          SESSION_COOKIE_SECRET=ci-only-session-secret-do-not-reuse-0000000000
+          CSRF_SECRET=ci-only-csrf-secret-do-not-reuse-000000000000000
+          EOF
+
+      # This is also the first time the Dockerfiles/compose file are ever
+      # built and run anywhere (they were written and structurally verified,
+      # but not executed, in an environment without Docker) — this step
+      # doubles as smoke-testing them.
+      - name: Build and start the full stack
+        run: docker compose up -d --build
+
+      - name: Wait for the API and web app to be ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:4000/health && curl -sf http://localhost:3000 >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Stack did not become ready in time" >&2
+          exit 1
+
+      - name: Run Playwright E2E suite
+        working-directory: apps/e2e
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:3000
+          PLAYWRIGHT_API_URL: http://localhost:4000
+          PLAYWRIGHT_MAILDEV_URL: http://localhost:1080
+        run: pnpm exec playwright test
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: apps/e2e/playwright-report/
+          retention-days: 7
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear down the stack
+        if: always()
+        run: docker compose down -v --remove-orphans

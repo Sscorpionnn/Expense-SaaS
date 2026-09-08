@@ -1,0 +1,16 @@
+title = "Expense SaaS gitleaks config"
+
+# Use gitleaks' full default ruleset, then layer a narrow allowlist on top
+# for values that are secret-shaped (to satisfy packages/config/src/env.ts's
+# >=32-char validation) but are known-fake, committed-on-purpose CI/dev
+# fixtures — not real credentials. Keep this list in sync with
+# .github/workflows/ci.yml's integration-tests/e2e jobs and .env.example.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known-fake CI/dev-only placeholder secrets, not real credentials"
+regexes = [
+  '''CHANGE_ME''',
+  '''ci-only-[a-z0-9-]+''',
+]

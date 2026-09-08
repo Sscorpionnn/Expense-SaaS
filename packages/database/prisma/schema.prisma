@@ -1,0 +1,491 @@
+// Prisma schema for Expense SaaS.
+// Models are added incrementally per the phased build plan (see docs/architecture.md) —
+// this file currently only wires up the datasource/generator as part of the initial scaffold.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — Auth foundation
+// ---------------------------------------------------------------------------
+
+enum VerificationTokenPurpose {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+}
+
+enum DeletionRequestStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  COMPLETED
+  CANCELLED
+}
+
+enum AuditAction {
+  REGISTER
+  LOGIN_SUCCESS
+  LOGIN_FAILURE
+  LOGOUT
+  EMAIL_VERIFIED
+  EMAIL_VERIFICATION_RESENT
+  PASSWORD_RESET_REQUESTED
+  PASSWORD_RESET_COMPLETED
+  SESSION_REVOKED
+  ACCOUNT_DELETION_REQUESTED
+  ACCOUNT_DELETION_CONFIRMED
+  ACCOUNT_DELETION_CANCELLED
+  FINANCIAL_ACCOUNT_CREATED
+  FINANCIAL_ACCOUNT_ARCHIVED
+  FINANCIAL_ACCOUNT_DELETED
+  TRANSACTION_CREATED
+  TRANSACTION_UPDATED
+  TRANSACTION_DELETED
+  BUDGET_CREATED
+  BUDGET_DELETED
+  GOAL_CREATED
+  GOAL_DELETED
+  RECURRING_TRANSACTION_CREATED
+  RECURRING_TRANSACTION_DELETED
+  CSV_IMPORT_UPLOADED
+  DATA_EXPORT_REQUESTED
+  DATA_EXPORT_DOWNLOADED
+  ACCOUNT_DELETION_PURGED
+  PRIVACY_SETTINGS_UPDATED
+}
+
+model User {
+  id                  String    @id @default(cuid())
+  email               String    @unique
+  passwordHash        String
+  name                String
+  emailVerifiedAt     DateTime?
+  isActive            Boolean   @default(true)
+  defaultCurrency     String    @default("USD")
+  timezone            String    @default("UTC")
+  // Opt-in only — anonymized product-usage analytics, never financial data.
+  shareUsageAnalytics Boolean   @default(false)
+  deletedAt           DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  sessions              Session[]
+  verificationTokens    VerificationToken[]
+  auditLogs             AuditLog[]
+  deletionRequests      DeletionRequest[]
+  accounts              Account[]
+  categories            Category[]
+  transactions          Transaction[]
+  budgets               Budget[]
+  goals                 FinancialGoal[]
+  recurringTransactions RecurringTransaction[]
+  notifications         Notification[]
+  csvImportJobs         CsvImportJob[]
+  dataExportRequests    DataExportRequest[]
+
+  @@map("users")
+}
+
+model Session {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Only the hash is persisted — the raw opaque token lives solely in the
+  // httpOnly session cookie, never in the database or in logs.
+  tokenHash String    @unique
+  userAgent String?
+  ipHash    String?
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model VerificationToken {
+  id         String                   @id @default(cuid())
+  userId     String
+  user       User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  purpose    VerificationTokenPurpose
+  // Only the hash is persisted — the raw single-use token is only ever
+  // emailed to the user, never stored or logged in plaintext.
+  tokenHash  String                   @unique
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime                 @default(now())
+
+  @@index([userId, purpose])
+  @@map("verification_tokens")
+}
+
+model AuditLog {
+  id            String      @id @default(cuid())
+  // Nullable — pre-auth events (e.g. a failed login) have no authenticated user.
+  userId        String?
+  user          User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action        AuditAction
+  targetType    String?
+  targetId      String?
+  ipHash        String?
+  userAgentHash String?
+  // Pre-sanitized only — never passwords, tokens, or full financial records.
+  metadata      Json?
+  createdAt     DateTime    @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+model DeletionRequest {
+  id                    String                @id @default(cuid())
+  userId                String
+  user                  User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status                DeletionRequestStatus @default(PENDING)
+  confirmationTokenHash String?               @unique
+  requestedAt           DateTime              @default(now())
+  confirmedAt           DateTime?
+  scheduledPurgeAt      DateTime?
+  completedAt           DateTime?
+  cancelledAt           DateTime?
+
+  @@index([userId])
+  @@map("deletion_requests")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — Core financial domain
+// ---------------------------------------------------------------------------
+
+enum AccountType {
+  CASH
+  BANK
+  CREDIT_CARD
+  SAVINGS
+  WALLET
+}
+
+enum CategoryType {
+  INCOME
+  EXPENSE
+}
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+  TRANSFER
+}
+
+model Account {
+  id           String      @id @default(cuid())
+  userId       String
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name         String
+  type         AccountType
+  currency     String
+  // Cached running balance, maintained transactionally alongside every
+  // Transaction write (see TransactionsService) so reads stay fast — never
+  // written to directly from client input.
+  balanceMinor BigInt      @default(0)
+  isArchived   Boolean     @default(false)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  transactions          Transaction[]          @relation("AccountTransactions")
+  incomingTransfers     Transaction[]          @relation("TransferDestination")
+  recurringTransactions RecurringTransaction[]
+  linkedGoals           FinancialGoal[]
+  csvImportJobs         CsvImportJob[]
+
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Category {
+  id     String       @id @default(cuid())
+  // Null = a system default category, visible to and usable by every user
+  // but not owned/editable by any of them. Non-null = a user's own custom
+  // category, usable only by that user.
+  userId String?
+  user   User?        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name   String
+  icon   String?
+  color  String?
+  type   CategoryType
+
+  transactions          Transaction[]
+  budgets               Budget[]
+  recurringTransactions RecurringTransaction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@map("categories")
+}
+
+model Transaction {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  accountId String
+  account   Account @relation("AccountTransactions", fields: [accountId], references: [id], onDelete: Restrict)
+
+  // Required for INCOME/EXPENSE, null for TRANSFER.
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  // Destination account for TRANSFER only; null otherwise.
+  transferAccountId String?
+  transferAccount   Account? @relation("TransferDestination", fields: [transferAccountId], references: [id], onDelete: Restrict)
+
+  type        TransactionType
+  // Always a positive integer in minor units — direction comes from `type`,
+  // never from the sign, so it can't be spoofed by a negative client value.
+  amountMinor BigInt
+  currency    String
+
+  description String?
+  merchant    String?
+  notes       String?
+  occurredAt  DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, occurredAt])
+  @@index([accountId])
+  @@index([categoryId])
+  @@map("transactions")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — Budgets, goals, recurring transactions, notifications
+// ---------------------------------------------------------------------------
+
+enum BudgetPeriodType {
+  MONTHLY
+  CUSTOM
+}
+
+enum GoalStatus {
+  ACTIVE
+  COMPLETED
+  PAUSED
+  CANCELLED
+}
+
+enum RecurringFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+enum NotificationType {
+  RECURRING_REMINDER
+  BUDGET_THRESHOLD
+  GOAL_DEADLINE
+  EXPORT_READY
+  SECURITY_ALERT
+}
+
+model Budget {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Null = an overall budget across every EXPENSE category.
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  name        String
+  amountMinor BigInt
+  currency    String
+  periodType  BudgetPeriodType
+  // MONTHLY: anchor date (periods roll monthly from here). CUSTOM: the
+  // period's exact start.
+  startDate   DateTime
+  // Required for CUSTOM, null for MONTHLY.
+  endDate     DateTime?
+  isActive    Boolean          @default(true)
+
+  periods BudgetPeriod[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@map("budgets")
+}
+
+model BudgetPeriod {
+  id       String @id @default(cuid())
+  budgetId String
+  budget   Budget @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+
+  periodStart DateTime
+  periodEnd   DateTime
+  // Snapshot of Budget.amountMinor when this period was created — editing
+  // the budget later doesn't rewrite history for past periods.
+  amountMinor BigInt
+  // Refreshed from live Transaction data whenever progress is read — not
+  // eagerly kept in sync on every transaction write.
+  spentMinor  BigInt   @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([budgetId, periodStart])
+  @@map("budget_periods")
+}
+
+model FinancialGoal {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name               String
+  targetAmountMinor  BigInt
+  currentAmountMinor BigInt     @default(0)
+  currency           String
+  deadline           DateTime?
+  status             GoalStatus @default(ACTIVE)
+
+  // Optional — purely informational (e.g. "this is the savings account I'm
+  // using for this goal"); contributions are tracked on the goal itself,
+  // not derived from the account's real transactions.
+  linkedAccountId String?
+  linkedAccount   Account? @relation(fields: [linkedAccountId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@map("financial_goals")
+}
+
+model RecurringTransaction {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  categoryId String
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  // INCOME or EXPENSE only — recurring transfers aren't supported.
+  type        TransactionType
+  amountMinor BigInt
+  currency    String
+  description String?
+  merchant    String?
+
+  frequency          RecurringFrequency
+  interval           Int                @default(1)
+  startDate          DateTime
+  // Next time the worker's sweep should remind the user about this.
+  nextOccurrenceAt   DateTime
+  endDate            DateTime?
+  isActive           Boolean            @default(true)
+  lastReminderSentAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([isActive, nextOccurrenceAt])
+  @@map("recurring_transactions")
+}
+
+model Notification {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type     NotificationType
+  title    String
+  body     String
+  isRead   Boolean          @default(false)
+  metadata Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — CSV import/export, analytics
+// ---------------------------------------------------------------------------
+
+enum CsvImportStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum DataExportStatus {
+  PENDING
+  PROCESSING
+  READY
+  EXPIRED
+  FAILED
+}
+
+model CsvImportJob {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // The single account every row in this CSV posts against — matches how
+  // real bank/card CSV exports work (one file per account).
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  status  CsvImportStatus @default(PENDING)
+  // Object key in the "imports" bucket for the raw uploaded file.
+  fileKey String
+
+  totalRows    Int?
+  importedRows Int?
+  skippedRows  Int?
+  // Array of { row: number, message: string } — never raw file content.
+  errors       Json?
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  @@index([userId])
+  @@map("csv_import_jobs")
+}
+
+model DataExportRequest {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status        DataExportStatus @default(PENDING)
+  // Object key in the "exports" bucket — set once the file is generated.
+  storageKey    String?
+  fileSizeBytes Int?
+
+  requestedAt  DateTime  @default(now())
+  readyAt      DateTime?
+  expiresAt    DateTime?
+  downloadedAt DateTime?
+
+  @@index([userId])
+  @@map("data_export_requests")
+}

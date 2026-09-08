@@ -1,0 +1,10 @@
+{
+  "extends": "@expense-saas/tsconfig/base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "outDir": "./dist",
+    "rootDir": "."
+  },
+  "include": ["src", "prisma/seed.ts"]
+}

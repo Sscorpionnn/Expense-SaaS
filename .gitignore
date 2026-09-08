@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Env / secrets — never commit real values
+.env
+.env.*
+!.env.example
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+.turbo/
+
+# Test / coverage
+coverage/
+playwright-report/
+test-results/
+blob-report/
+
+# Prisma
+apps/**/generated/
+packages/database/generated/
+
+# Docker local data volumes
+docker/data/
+**/pgdata/
+**/redisdata/
+**/miniodata/
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+pnpm-debug.log*
+
+# Editors / OS
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Misc
+*.pem
+*.local

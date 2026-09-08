@@ -1,0 +1,33 @@
+{
+  "name": "@expense-saas/config",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./currency": { "types": "./dist/currency.d.ts", "default": "./dist/currency.js" },
+    "./constants": { "types": "./dist/constants.d.ts", "default": "./dist/constants.js" },
+    "./env": { "types": "./dist/env.d.ts", "default": "./dist/env.js" }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "jest",
+    "test": "jest"
+  },
+  "dependencies": {
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@expense-saas/eslint-config": "workspace:*",
+    "@expense-saas/tsconfig": "workspace:*",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.10.2",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.7.2"
+  }
+}

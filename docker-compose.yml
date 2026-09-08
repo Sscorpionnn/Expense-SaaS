@@ -1,0 +1,158 @@
+# Local development / self-hosted stack.
+# All ports are bound to 127.0.0.1 — never publish these on a public interface.
+
+x-app-env: &app-env
+  NODE_ENV: production
+  WEB_URL: ${WEB_URL:-http://localhost:3000}
+  API_URL: http://api:4000
+  DATABASE_URL: postgresql://${POSTGRES_USER:-CHANGE_ME}:${POSTGRES_PASSWORD:-CHANGE_ME}@postgres:5432/${POSTGRES_DB:-expense_saas}?schema=public
+  REDIS_URL: redis://redis:6379
+  S3_ENDPOINT: http://minio:9000
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-CHANGE_ME}
+  S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-CHANGE_ME}
+  S3_BUCKET_EXPORTS: ${S3_BUCKET_EXPORTS:-expense-saas-exports}
+  S3_BUCKET_IMPORTS: ${S3_BUCKET_IMPORTS:-expense-saas-imports}
+  SMTP_HOST: maildev
+  SMTP_PORT: 1025
+  SMTP_FROM: ${SMTP_FROM:-Expense SaaS <no-reply@expense-saas.local>}
+  SESSION_COOKIE_SECRET: ${SESSION_COOKIE_SECRET:-CHANGE_ME}
+  CSRF_SECRET: ${CSRF_SECRET:-CHANGE_ME}
+  SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-720}
+  THROTTLE_TTL_SECONDS: ${THROTTLE_TTL_SECONDS:-60}
+  THROTTLE_LIMIT: ${THROTTLE_LIMIT:-100}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-CHANGE_ME}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME}
+      POSTGRES_DB: ${POSTGRES_DB:-expense_saas}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-CHANGE_ME} -d ${POSTGRES_DB:-expense_saas}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-CHANGE_ME}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-CHANGE_ME}
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  maildev:
+    image: maildev/maildev:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MAILDEV_WEB_PORT:-1080}:1080"
+      - "127.0.0.1:1025:1025"
+
+  # One-off: applies pending Prisma migrations, then exits. api/worker wait
+  # for it to finish successfully before starting. Uses the api image's
+  # `builder` stage since that's the only stage with the prisma CLI
+  # (a devDependency, stripped from the api/worker runtime images).
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: builder
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-CHANGE_ME}:${POSTGRES_PASSWORD:-CHANGE_ME}@postgres:5432/${POSTGRES_DB:-expense_saas}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["pnpm", "--filter", "@expense-saas/database", "run", "migrate:deploy"]
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+    ports:
+      - "127.0.0.1:${API_PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      maildev:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      maildev:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      # Server-side fetches (apps/web/src/lib/server-api.ts) call the API
+      # over the Docker network — distinct from NEXT_PUBLIC_API_URL above,
+      # which is baked into the browser bundle at build time and must be
+      # reachable from the user's browser instead.
+      API_URL: http://api:4000
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  miniodata:
